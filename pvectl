@@ -1,0 +1,1490 @@
+#!/usr/bin/env python3
+
+"""
+pvectl: Proxmox VE local CLI wrapper
+
+Initial skeleton with basic subcommands and placeholders.
+Integrate with Proxmox API in subsequent commits (e.g., via proxmoxer).
+"""
+
+import argparse
+import configparser
+import os
+import sys
+import inspect
+import re
+import requests
+import urllib3
+import time
+from typing import Optional
+from dataclasses import dataclass
+
+__version__ = "0.1.0"
+# Suppress InsecureRequestWarning since we intentionally disable TLS verification
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+@dataclass
+class PvectlConfig:
+    host: Optional[str] = None
+    user: Optional[str] = None
+    token_id: Optional[str] = None
+    token_secret: Optional[str] = None
+    profile: str = "default"
+    config_path: Optional[str] = None
+    port: int = 8006
+    node: Optional[str] = None
+    # Script-level environment defaults (not from profile file)
+    default_bridge: Optional[str] = None
+    default_disk_storage: Optional[str] = None
+    
+
+
+class Proxmox:
+    def __init__(self, host, port, node, user, token_id, token_secret):
+        self.host = host
+        self.node = node
+        self.base = f"https://{host}:{port}/api2/json"
+        self.token_id = token_id
+        self.secret = token_secret
+        self.session = requests.Session()
+        self.session.verify = False
+        auth = f"PVEAPIToken {user}!{self.token_id}={self.secret}"
+        self.session.headers.update({
+            "Authorization": auth
+        })
+
+    def get(self, path, params=None):
+        response = self.session.get(f"{self.base}/{path}", params=params)
+        response.raise_for_status()
+        return response.json()["data"]
+    
+    def post(self, path, data=None):
+        response = self.session.post(f"{self.base}/{path}", data=data)
+        response.raise_for_status()
+        return response.json()["data"]
+
+    def delete(self, path, params=None):
+        response = self.session.delete(f"{self.base}/{path}", params=params)
+        response.raise_for_status()
+        return response.json()["data"]
+
+
+# ---- CLI wiring ----
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="pvectl",
+        description="Manage Proxmox VMs and nodes from your local machine.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+
+    # Global connection options (placeholders for now)
+    parser.add_argument("--profile", help="Profile name in ~/.pvectl/profile.ini", default=None)
+    parser.add_argument("--config", help="Path to profiles.ini (override default)", default=None)
+    parser.add_argument("--host", help="Proxmox host only (no scheme), e.g. pve.example")
+    parser.add_argument("--port", type=int, help="Proxmox API port (default 8006)")
+    parser.add_argument("--node", help="Default Proxmox node name (overrides profile/env)")
+    parser.add_argument("--user", help="Proxmox user (e.g. root@pam or user@pve)")
+    parser.add_argument("--token-id", help="Proxmox API token id")
+    parser.add_argument("--token-secret", help="Proxmox API token secret")
+    # Always operate without TLS verification for now; no --insecure flag
+
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
+
+    # list
+    p_list = sub.add_parser("list", help="List VMs")
+    p_list.add_argument("--verbose", "-v", action="store_true", help="Also print VM name with VMID")
+    p_list.add_argument("--name", help="Filter by exact VM name; prints matching VMIDs only")
+
+    # create (empty VM: no disk, no NIC)
+    p_create = sub.add_parser("create", help="Create an empty VM (no disk/NIC)")
+    p_create.add_argument("name", help="VM name")
+    p_create.add_argument("--cores", type=int, default=1, help="vCPU cores (default: 1)")
+    p_create.add_argument("--memory", type=str, default="2048", help="Memory size: MiB (e.g. 2048) or GiB with 'G' suffix (e.g. 2G)")
+
+    # disk <subcommand>
+    p_disk = sub.add_parser("disk", help="Disk operations")
+    disk_sub = p_disk.add_subparsers(dest="disk_command", metavar="<subcommand>")
+    p_disk_add = disk_sub.add_parser("add", help="Attach a disk to a VM")
+    p_disk_add.add_argument("vmid", help="Target VMID")
+    p_disk_add.add_argument("--slot", default=None, help="Disk slot, e.g. scsi0, sata0, virtio0 (required)")
+    p_disk_add.add_argument("--storage", default=None, help="Proxmox storage ID (default: auto; prefers local-lvm). Use '?' to list usable storages.")
+    p_disk_add.add_argument("--size", default="8G", help="Disk size, e.g. 20G (default: 8G)")
+
+    # cdrom <subcommand>
+    p_cdrom = sub.add_parser("cdrom", help="CD/DVD drive and ISO operations")
+    cdrom_sub = p_cdrom.add_subparsers(dest="cdrom_command", metavar="<subcommand>")
+    p_cdrom_add = cdrom_sub.add_parser("add", help="Create/update a CD/DVD drive and insert ISO (requires VM off)")
+    p_cdrom_add.add_argument("vmid", help="Target VMID")
+    p_cdrom_add.add_argument("--slot", default="ide2", help="Optical drive slot (default: ide2)")
+    p_cdrom_add.add_argument("--storage", default="local", help="Proxmox storage ID (default: local)")
+    p_cdrom_add.add_argument("--iso", required=True, help="ISO filename in storage, e.g. debian-12.iso (use 'iso list' to view available ISOs)")
+    p_cdrom_remove = cdrom_sub.add_parser("remove", help="Remove the CD/DVD drive device from the VM (requires VM off)")
+    p_cdrom_remove.add_argument("vmid", help="Target VMID")
+    p_cdrom_remove.add_argument("--slot", default=None, help="Optical drive slot to remove (e.g. ide2). Use 'cdrom list <vmid>' to discover slots")
+
+    p_cdrom_list = cdrom_sub.add_parser("list", help="List CD/DVD drive slots with attached ISO (or <none>)")
+    p_cdrom_list.add_argument("vmid", help="Target VMID")
+
+    p_cdrom_eject = cdrom_sub.add_parser("eject", help="Eject ISO from a VM's CD/DVD drive (keeps the drive)")
+    p_cdrom_eject.add_argument("vmid", help="Target VMID")
+    p_cdrom_eject.add_argument("--slot", default=None, help="Optical drive slot to eject from (e.g. ide2). Use 'cdrom list <vmid>' to discover slots")
+
+    # iso <subcommand>
+    p_iso = sub.add_parser("iso", help="Manage ISO images in storage")
+    iso_sub = p_iso.add_subparsers(dest="iso_command", metavar="<subcommand>")
+    p_iso_list = iso_sub.add_parser("list", help="List ISO images in a storage")
+    p_iso_list.add_argument("--storage", default="local", help="Proxmox storage ID (default: local). Use '?' to list storages supporting iso")
+    p_iso_list.add_argument("--verbose", "-v", action="store_true", help="Show storage and pretty-indented output (stderr + indented filenames)")
+    p_iso_upload = iso_sub.add_parser("upload", help="Upload an ISO to a storage")
+    p_iso_upload.add_argument("--storage", default="local", help="Proxmox storage ID (default: local)")
+    p_iso_upload.add_argument("--file", required=True, help="Path to local ISO file to upload")
+    p_iso_delete = iso_sub.add_parser("delete", help="Delete an ISO from a storage")
+    p_iso_delete.add_argument("--storage", default="local", help="Proxmox storage ID (default: local)")
+    p_iso_delete.add_argument("--name", required=True, help="ISO filename to delete (e.g. alpine-standard-3.20.2-x86_64.iso)")
+    
+    # nic <subcommand>
+    p_nic = sub.add_parser("nic", help="NIC operations")
+    nic_sub = p_nic.add_subparsers(dest="nic_command", metavar="<subcommand>")
+    p_nic_add = nic_sub.add_parser("add", help="Attach a NIC to a VM")
+    p_nic_add.add_argument("vmid", help="Target VMID")
+    p_nic_add.add_argument("--slot", default=None, help="NIC slot, e.g. net0, net1 (required)")
+    p_nic_add.add_argument("--bridge", required=False, default=None, help="Bridge, e.g. vmbr0 (use '?' to list). If omitted, uses PVECTL_DEFAULT_BRIDGE if set")
+    p_nic_add.add_argument("--model", default="virtio", help="Model, e.g. virtio,e1000 (default: virtio)")
+    p_nic_add.add_argument("--mac", help="Optional MAC address")
+
+    # status
+    p_status = sub.add_parser("status", help="Show VM status")
+    p_status.add_argument("vmid", help="VMID or name")
+    p_status.add_argument("--onoff", action="store_true", help="Print only 'on' or 'off' for easy shell capture")
+
+    # start
+    p_start = sub.add_parser("start", help="Start a VM")
+    p_start.add_argument("vmid", help="VMID or name")
+    p_start.add_argument("--force", action="store_true", help="Force start if applicable")
+
+    # stop
+    p_stop = sub.add_parser("stop", help="Hard stop (power off) a VM")
+    p_stop.add_argument("vmid", help="VMID or name")
+
+    # restart removed; use stop + start if needed
+
+    # info
+    p_info = sub.add_parser("info", help="Show VM hardware configuration")
+    p_info.add_argument("vmid", help="VMID")
+
+    # remove
+    p_remove = sub.add_parser("remove", help="Remove a VM (VMID only)")
+    p_remove.add_argument("vmid", help="VMID (use 'list --name' to discover VMIDs)")
+
+    # options
+    p_opts = sub.add_parser("options", help="Manage VM options")
+    p_opts.add_argument("vmid", help="VMID")
+    p_opts.add_argument("--boot", help="Comma-separated boot devices, e.g. ide2,virtio0,net0. Use '?' to list available devices.")
+
+    return parser
+
+
+def _default_config_path() -> str:
+    return os.path.expanduser("~/.pvectl/profile.ini")
+
+
+def _load_file_profile(config_path: str, profile: str) -> dict:
+    data: dict[str, str] = {}
+    if not os.path.exists(config_path):
+        return data
+    cp = configparser.ConfigParser()
+    cp.read(config_path)
+
+    # Exact section match
+    if cp.has_section(profile):
+        sect = cp[profile]
+    else:
+        # Fallback: if only one section exists, use it implicitly
+        sections = cp.sections()
+        if profile == "default" and len(sections) == 1:
+            sect = cp[sections[0]]
+        else:
+            return data
+
+    for key in ("host", "port", "user", "token_id", "token_secret", "node"):
+        if key in sect:
+            data[key] = sect.get(key, fallback=None)  # type: ignore[assignment]
+    return data
+
+
+def _load_env_overrides() -> dict:
+    env = os.environ
+    data: dict[str, str] = {}
+    mapping = {
+        "PVECTL_HOST": "host",
+        "PVECTL_PORT": "port",
+        "PVECTL_NODE": "node",
+        "PVECTL_USER": "user",
+        "PVECTL_TOKEN_ID": "token_id",
+        "PVECTL_TOKEN_SECRET": "token_secret",
+        # Script-level convenience defaults
+        "PVECTL_DEFAULT_BRIDGE": "default_bridge",
+        "PVECTL_DEFAULT_DISK_STORAGE": "default_disk_storage",
+    }
+    for env_key, conf_key in mapping.items():
+        if env_key in env and env[env_key] != "":
+            data[conf_key] = env[env_key]
+    # Profile can also come from env
+    if env.get("PVECTL_PROFILE"):
+        data["profile"] = env["PVECTL_PROFILE"]
+    return data
+
+
+def load_config(args: argparse.Namespace) -> PvectlConfig:
+    # Determine profile and config path (CLI > env > default)
+    env_cfg = os.environ.get("PVECTL_CONFIG")
+    config_path = (
+        os.path.expanduser(args.config) if getattr(args, "config", None) else (
+            os.path.expanduser(env_cfg) if env_cfg else _default_config_path()
+        )
+    )
+    profile = (
+        args.profile
+        if args.profile
+        else os.environ.get("PVECTL_PROFILE", "default")
+    )
+
+    # Load from file
+    file_values = _load_file_profile(config_path, profile)
+
+    # Load env overrides
+    env_values = _load_env_overrides()
+
+    # Build base config from file
+    host = file_values.get("host")
+    port_val = file_values.get("port")
+    user = file_values.get("user")
+    token_id = file_values.get("token_id")
+    token_secret = file_values.get("token_secret")
+    node_val = file_values.get("node")
+
+    # Apply env overrides
+    host = env_values.get("host", host)
+    if "port" in env_values:
+        port_val = env_values["port"]
+    if "node" in env_values:
+        node_val = env_values["node"]
+    user = env_values.get("user", user)
+    token_id = env_values.get("token_id", token_id)
+    token_secret = env_values.get("token_secret", token_secret)
+
+    # Apply CLI overrides (highest precedence)
+    host = args.host or host
+    cli_port = args.port
+    cli_node = args.node
+    user = args.user or user
+    token_id = args.token_id or token_id
+    token_secret = args.token_secret or token_secret
+
+    # Insecure precedence: CLI flag wins if set, else env/file
+    # TLS verification is always disabled for now; no config handling
+
+    # Port precedence and parsing
+    def _parse_port(val) -> Optional[int]:
+        if val is None:
+            return None
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return None
+
+    if cli_port is not None:
+        port = cli_port
+    else:
+        parsed = _parse_port(port_val)
+        port = parsed if parsed is not None else 8006
+
+    # Node precedence
+    node = cli_node or node_val
+
+    # Final profile resolution with precedence env > CLI default
+    final_profile = (
+        args.profile
+        if args.profile
+        else env_values.get("profile", profile)
+    )
+
+    return PvectlConfig(
+        host=host,
+        port=port,
+        node=node,
+        user=user,
+        token_id=token_id,
+        token_secret=token_secret,
+        profile=final_profile,
+        config_path=config_path,
+        default_bridge=env_values.get("default_bridge"),
+        default_disk_storage=env_values.get("default_disk_storage"),
+    )
+
+
+# ---- Helpers ----
+
+def check_auth(cfg: PvectlConfig) -> None:
+    missing = []
+    if not cfg.host:
+        missing.append("host")
+    if not cfg.user:
+        missing.append("user")
+    if not cfg.token_id:
+        missing.append("token_id")
+    if not cfg.token_secret:
+        missing.append("token_secret")
+    if not cfg.node:
+        missing.append("node")
+    if missing:
+        print(f"pvectl: missing config values: {', '.join(missing)}", file=sys.stderr)
+        sys.exit(2)
+
+def _resolve_node_for_vmid(px: Proxmox, vmid: str) -> str:
+    items = px.get("cluster/resources", params={"type": "vm"})
+    for it in items:
+        if str(it.get("vmid")) == str(vmid):
+            node = it.get("node")
+            if node:
+                return node
+    raise RuntimeError(f"vmid not found: {vmid}")
+
+
+def _resolve_vmid_and_node(px: Proxmox, identifier: str) -> tuple[str, str]:
+    """Resolve an input identifier that may be a VMID or a VM name.
+
+    Returns (vmid, node). If multiple VMs match a name, raises an error to avoid
+    ambiguous destructive actions. If no match is found, raises an error.
+    """
+    ident = str(identifier)
+    # If purely digits, treat as VMID
+    if ident.isdigit():
+        node = _resolve_node_for_vmid(px, ident)
+        return ident, node
+
+    # Otherwise, match by name across cluster resources (QEMU only)
+    items = px.get("cluster/resources", params={"type": "vm"})
+    matches: list[tuple[str, str]] = []
+    for it in items:
+        name = str(it.get("name", ""))
+        if name == ident:
+            vid = str(it.get("vmid"))
+            node = str(it.get("node"))
+            if vid and node:
+                matches.append((vid, node))
+
+    if not matches:
+        raise RuntimeError(f"VM name not found: {ident}")
+    if len(matches) > 1:
+        # Ambiguous; list candidates in error for clarity
+        options = ", ".join([f"{vid}@{node}" for vid, node in matches])
+        raise RuntimeError(
+            f"multiple VMs match name '{ident}': {options}; specify VMID"
+        )
+    return matches[0]
+
+
+def _parse_memory_to_mib(val) -> int:
+    m = re.fullmatch(r"(\d+)(G)?", str(val))
+    if not m:
+        raise ValueError(f"invalid memory value: {val}")
+    num = int(m.group(1))
+    # No suffix means MiB; 'G' means GiB
+    return num if m.group(2) is None else num * 1024
+
+
+def _parse_size_to_gib(val) -> int:
+    m = re.fullmatch(r"(\d+)(G)?", str(val))
+    if not m:
+        raise ValueError(f"invalid disk size value: {val}")
+    num = int(m.group(1))
+    # For disks: plain digits or digits+'G' both mean GiB
+    return num
+
+
+# ---- Shared wait helpers ----
+
+def _extract_upid(result) -> Optional[str]:
+    if isinstance(result, str) and result.startswith("UPID:"):
+        return result
+    if isinstance(result, dict):
+        val = result.get("upid") or result.get("taskid")
+        if isinstance(val, str) and val.startswith("UPID:"):
+            return val
+    return None
+
+
+def _wait_for_task_completion(px: Proxmox, node_name: str, task_upid: str, timeout: int = 600, interval: float = 0.5) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            st = px.get(f"nodes/{node_name}/tasks/{task_upid}/status")
+        except requests.exceptions.RequestException:
+            time.sleep(interval)
+            continue
+        exitstatus = st.get("exitstatus")
+        if exitstatus is not None:
+            return str(exitstatus).upper() == "OK"
+        status = st.get("status")
+        if status in ("stopped", "finished"):
+            return True
+        time.sleep(interval)
+    return False
+
+
+def _wait_for_vm_config(px: Proxmox, node_name: str, vm_id: int, timeout: int = 300, interval: float = 0.5) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            conf = px.get(f"nodes/{node_name}/qemu/{vm_id}/config")
+            if isinstance(conf, dict) and conf:
+                return True
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(interval)
+    return False
+
+
+def _wait_for_config_key(px: Proxmox, node_name: str, vm_id: int, key: str, timeout: int = 300, interval: float = 0.5) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            conf = px.get(f"nodes/{node_name}/qemu/{vm_id}/config")
+            if isinstance(conf, dict) and key in conf:
+                return True
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(interval)
+    return False
+
+
+def _wait_for_config_key_absent(px: Proxmox, node_name: str, vm_id: int, key: str, timeout: int = 300, interval: float = 0.5) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            conf = px.get(f"nodes/{node_name}/qemu/{vm_id}/config")
+            if isinstance(conf, dict) and key not in conf:
+                return True
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(interval)
+    return False
+
+
+def _wait_for_vm_status(px: Proxmox, node_name: str, vm_id: int, desired: str, timeout: int = 300, interval: float = 0.5) -> bool:
+    desired = str(desired)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            st = px.get(f"nodes/{node_name}/qemu/{vm_id}/status/current")
+            cur = str(st.get("status"))
+            if cur == desired:
+                return True
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(interval)
+    return False
+
+
+def _wait_for_cdrom_ejected(px: Proxmox, node_name: str, vm_id: int, slot: str, timeout: int = 120, interval: float = 0.5) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            conf = px.get(f"nodes/{node_name}/qemu/{vm_id}/config")
+            val = conf.get(slot)
+            if isinstance(val, str):
+                s = str(val)
+                # Consider ejected when still a cdrom drive but no ISO path present
+                if "media=cdrom" in s and ":iso/" not in s:
+                    return True
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(interval)
+    return False
+
+
+def _find_next_free_slot(px: Proxmox, node_name: str, vm_id: int, bus: str = "virtio", max_slots: int = 32) -> Optional[str]:
+    try:
+        conf = px.get(f"nodes/{node_name}/qemu/{vm_id}/config")
+    except requests.exceptions.RequestException:
+        return None
+    for i in range(max_slots):
+        key = f"{bus}{i}"
+        if key not in conf:
+            return key
+    return None
+
+
+def _netmask_to_prefix(netmask: str) -> Optional[int]:
+    # Accept dotted IPv4 netmask or numeric prefix (e.g., "255.255.255.0" or "24")
+    nm = str(netmask).strip()
+    if nm.isdigit():
+        try:
+            val = int(nm)
+            if 0 <= val <= 32:
+                return val
+        except ValueError:
+            return None
+        return None
+    parts = nm.split(".")
+    if len(parts) != 4:
+        return None
+    try:
+        total = 0
+        for p in parts:
+            octet = int(p)
+            if not (0 <= octet <= 255):
+                return None
+            # Count contiguous ones is complex; approximate by counting ones
+            total += bin(octet).count("1")
+        if 0 <= total <= 32:
+            return total
+    except ValueError:
+        return None
+    return None
+
+
+# ---- Boot order helpers ----
+
+def _parse_boot_order_val(val: Optional[str]) -> list[str]:
+    s = str(val or "")
+    if "order=" in s:
+        s = s.split("order=", 1)[1]
+    parts = [p.strip() for p in s.split(";") if p and p.strip()]
+    return parts
+
+
+def _ensure_boot_includes(px: Proxmox, node_name: str, vm_id: int, slot: str, timeout: int = 120, interval: float = 0.5) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            conf = px.get(f"nodes/{node_name}/qemu/{vm_id}/config")
+            boot = conf.get("boot")
+            order = _parse_boot_order_val(boot)
+            if slot in order:
+                return True
+        except requests.exceptions.RequestException:
+            pass
+        time.sleep(interval)
+    return False
+
+
+def _append_boot_order(px: Proxmox, node_name: str, vm_id: int, slot: str) -> None:
+    # deprecated; no implicit boot-order modification
+    return None
+
+
+# ---- Command handlers ----
+
+def command_list(cfg: PvectlConfig, node: Optional[str] = None, verbose: bool = False, name: Optional[str] = None) -> int:
+    # Resolve target node from CLI override or profile
+    target_node = node or cfg.node
+
+    # Basic config validation
+    check_auth(cfg)
+
+    px = Proxmox(cfg.host, cfg.port, target_node, cfg.user, cfg.token_id, cfg.token_secret)
+
+    vmids: set[str] = set()
+    vm_names: dict[str, str] = {}
+
+    if target_node:
+        # QEMU VMs only
+        qemu = px.get(f"nodes/{target_node}/qemu")
+        for it in qemu:
+            if "vmid" in it:
+                vid = str(it["vmid"])
+                vmids.add(vid)
+                vmname = it.get("name")
+                if vmname is not None:
+                    vm_names[vid] = str(vmname)
+    else:
+        # No node specified; enumerate all nodes and collect QEMU only
+        nodes = px.get("nodes")
+        for n in nodes:
+            nname = n.get("node")
+            if not nname:
+                continue
+            qemu = px.get(f"nodes/{nname}/qemu")
+            for it in qemu:
+                if "vmid" in it:
+                    vid = str(it["vmid"])
+                    vmids.add(vid)
+                    vmname = it.get("name")
+                    if vmname is not None:
+                        vm_names[vid] = str(vmname)
+
+    # Print only VMIDs, one per line, sorted numerically if possible
+    # Optional name filter: restrict output to VMIDs with matching name
+    filtered_vmids = vmids
+    if name:
+        filtered_vmids = {vid for vid in vmids if vm_names.get(vid) == str(name)}
+
+    try:
+        for vid in sorted(filtered_vmids, key=lambda x: int(x)):
+            if verbose:
+                nm = vm_names.get(vid, "")
+                print(f"{vid} {nm}".rstrip())
+            else:
+                print(vid)
+    except ValueError:
+        for vid in sorted(filtered_vmids):
+            if verbose:
+                nm = vm_names.get(vid, "")
+                print(f"{vid} {nm}".rstrip())
+            else:
+                print(vid)
+
+    return 0
+
+
+def command_create(cfg: PvectlConfig, name: str, cores: int = 1, memory: str = "2048", node: Optional[str] = None) -> int:
+    # Require node for placement
+    target_node = node or cfg.node
+    check_auth(cfg)
+
+    px = Proxmox(cfg.host, cfg.port, target_node, cfg.user, cfg.token_id, cfg.token_secret)
+
+    # Get next available VMID
+    new_vmid = int(px.get("cluster/nextid"))
+
+    # Create empty VM (no disks/NICs); include cores/memory
+    # Parse memory value to MiB (supports G suffix)
+    try:
+        memory_mib = _parse_memory_to_mib(memory)
+    except ValueError as e:
+        print(f"pvectl: {e}", file=sys.stderr)
+        return 2
+
+    payload = {
+        "vmid": new_vmid,
+        "name": name,
+        "cores": int(cores),
+        "memory": int(memory_mib),
+    }
+    # Create VM and wait for completion by default
+    result = px.post(f"nodes/{target_node}/qemu", data=payload)
+
+    upid = _extract_upid(result)
+    ok = True
+    if upid:
+        ok = _wait_for_task_completion(px, target_node, upid)
+    else:
+        ok = _wait_for_vm_config(px, target_node, new_vmid)
+
+    if not ok:
+        print("pvectl: create did not complete within timeout", file=sys.stderr)
+        return 2
+
+    # Print vmid only for scripting once creation is confirmed
+    # Context for humans/scripts: emit a concise message to stderr
+    print(f"created VM {name} (vmid {new_vmid})", file=sys.stderr)
+    print(new_vmid)
+    return 0
+
+
+def command_disk_add(cfg: PvectlConfig, vmid: str, slot: Optional[str], storage: Optional[str], size: Optional[str], node: Optional[str] = None) -> int:
+    check_auth(cfg)
+
+    # Resolve node (use provided/global or discover by vmid)
+    px = Proxmox(cfg.host, cfg.port, cfg.node, cfg.user, cfg.token_id, cfg.token_secret)
+    target_node = node or cfg.node
+    if not target_node:
+        target_node = _resolve_node_for_vmid(px, vmid)
+
+    # If storage is '?' list usable storages for images
+    if storage == "?":
+        items = px.get(f"nodes/{target_node}/storage")
+        usable = []
+        for it in items:
+            name = it.get("storage") or it.get("name")
+            content = str(it.get("content", ""))
+            stype = it.get("type")
+            if name and ("images" in content):
+                usable.append((str(name), str(stype or ""), content))
+        for name, stype, content in sorted(usable):
+            print(f"{name} {stype} {content}")
+        return 0
+
+    # Auto-select storage if none provided: prefer env PVECTL_DEFAULT_DISK_STORAGE, else 'local-lvm', else first storage supporting images
+    if not storage:
+        items = px.get(f"nodes/{target_node}/storage")
+        # Try env default first
+        if cfg.default_disk_storage:
+            for it in items:
+                name = it.get("storage")
+                content = str(it.get("content", ""))
+                if name and str(name) == str(cfg.default_disk_storage) and ("images" in content):
+                    storage = str(name)
+                    break
+        if not storage:
+            names = [str(it.get("storage")) for it in items if it.get("storage")]
+            if "local-lvm" in names:
+                storage = "local-lvm"
+            else:
+                chosen = None
+                for it in items:
+                    name = it.get("storage")
+                    content = str(it.get("content", ""))
+                    if name and ("images" in content):
+                        chosen = str(name)
+                        break
+                if chosen:
+                    storage = chosen
+                else:
+                    print("pvectl: no storage with 'images' content found; specify --storage", file=sys.stderr)
+                    return 2
+
+    # Auto-pick slot if omitted: prefer next-free VirtIO slot
+    if not slot:
+        picked = _find_next_free_slot(px, target_node, int(vmid), bus="virtio")
+        if picked:
+            slot = picked
+        else:
+            print("pvectl: could not find a free virtio slot; specify --slot", file=sys.stderr)
+            return 2
+
+    # Validate required args for attach path
+    if not size:
+        print("pvectl: --size is required for disk add", file=sys.stderr)
+        return 2
+
+    # Parse size into GiB integer for API
+    try:
+        size_gib = _parse_size_to_gib(size)
+    except ValueError as e:
+        print(f"pvectl: {e}", file=sys.stderr)
+        return 2
+
+    # Attach disk at given slot (e.g., scsi0=storage:size)
+    data = {slot: f"{storage}:{size_gib}"}
+    result = px.post(f"nodes/{target_node}/qemu/{vmid}/config", data=data)
+    upid = _extract_upid(result)
+    ok = True
+    if upid:
+        ok = _wait_for_task_completion(px, target_node, upid)
+    else:
+        ok = _wait_for_config_key(px, target_node, int(vmid), slot)
+    if not ok:
+        print("pvectl: disk add did not complete within timeout", file=sys.stderr)
+        return 2
+    # Context message to stderr; stdout prints the slot only
+    print(f"disk add: vmid {vmid} slot {slot} storage {storage} size {size_gib}G", file=sys.stderr)
+    print(slot)
+    return 0
+
+
+def command_nic_add(cfg: PvectlConfig, vmid: str, slot: Optional[str], bridge: Optional[str], model: str = "virtio", mac: Optional[str] = None, node: Optional[str] = None) -> int:
+    check_auth(cfg)
+
+    px = Proxmox(cfg.host, cfg.port, cfg.node, cfg.user, cfg.token_id, cfg.token_secret)
+    target_node = node or cfg.node
+    if not target_node:
+        target_node = _resolve_node_for_vmid(px, vmid)
+
+    # If bridge is '?', list available bridges and exit
+    if bridge == "?":
+        items = px.get(f"nodes/{target_node}/network")
+        records: list[tuple[str, str]] = []
+        for it in items:
+            if str(it.get("type")) == "bridge" and it.get("iface"):
+                iface = str(it.get("iface"))
+                cidr = str(it.get("cidr")) if it.get("cidr") else ""
+                if not cidr:
+                    addr = it.get("address")
+                    netmask = it.get("netmask")
+                    if addr and netmask:
+                        pref = _netmask_to_prefix(str(netmask))
+                        if pref is not None:
+                            cidr = f"{addr}/{pref}"
+                records.append((iface, cidr))
+        for iface, cidr in sorted({(i, c) for i, c in records}):
+            if cidr:
+                print(f"{iface} {cidr}")
+            else:
+                print(iface)
+        return 0
+
+    # Use environment default bridge when omitted
+    if not bridge:
+        bridge = cfg.default_bridge
+    if not bridge:
+        print("pvectl: --bridge is required; or set PVECTL_DEFAULT_BRIDGE; or use '?' to list", file=sys.stderr)
+        return 2
+
+    # Auto-pick NIC slot if omitted: choose next-free netX
+    if not slot:
+        picked = _find_next_free_slot(px, target_node, int(vmid), bus="net")
+        if picked:
+            slot = picked
+        else:
+            print("pvectl: could not find a free net slot; specify --slot", file=sys.stderr)
+            return 2
+
+    spec = f"{model},bridge={bridge}"
+    if mac:
+        spec += f",macaddr={mac}"
+    data = {slot: spec}
+    result = px.post(f"nodes/{target_node}/qemu/{vmid}/config", data=data)
+    upid = _extract_upid(result)
+    ok = True
+    if upid:
+        ok = _wait_for_task_completion(px, target_node, upid)
+    else:
+        ok = _wait_for_config_key(px, target_node, int(vmid), slot)
+    if not ok:
+        print("pvectl: nic add did not complete within timeout", file=sys.stderr)
+        return 2
+    # Context message to stderr; stdout prints the slot only
+    extra = f" mac {mac}" if mac else ""
+    print(f"nic add: vmid {vmid} slot {slot} bridge {bridge} model {model}{extra}", file=sys.stderr)
+    print(slot)
+    return 0
+
+
+def command_status(cfg: PvectlConfig, vmid: str, onoff: bool = False) -> int:
+    check_auth(cfg)
+
+    # Resolve node (use provided/global or discover by vmid)
+    px = Proxmox(cfg.host, cfg.port, cfg.node, cfg.user, cfg.token_id, cfg.token_secret)
+    target_node = cfg.node
+    if not target_node:
+        try:
+            target_node = _resolve_node_for_vmid(px, vmid)
+        except requests.exceptions.RequestException as e:
+            print(f"pvectl: {e}", file=sys.stderr)
+            return 2
+
+    data = px.get(f"nodes/{target_node}/qemu/{vmid}/status/current")
+
+    if onoff:
+        status = str(data.get("status"))
+        qmp = str(data.get("qmpstatus"))
+        # Treat running/paused as 'on', stopped as 'off'
+        if status == "running" or qmp in {"running", "paused"}:
+            print("on")
+        else:
+            print("off")
+        return 0
+
+    # Print core runtime fields if present
+    for key in ("status", "qmpstatus", "uptime", "cpu", "mem", "maxmem", "pid", "lock"):
+        if key in data and data[key] is not None:
+            print(f"{key}: {data[key]}")
+    return 0
+
+
+def command_start(cfg: PvectlConfig, vmid: str, force: bool) -> int:
+    check_auth(cfg)
+
+    px = Proxmox(cfg.host, cfg.port, cfg.node, cfg.user, cfg.token_id, cfg.token_secret)
+    target_node = cfg.node
+    if not target_node:
+        try:
+            target_node = _resolve_node_for_vmid(px, vmid)
+        except requests.exceptions.RequestException as e:
+            print(f"pvectl: {e}", file=sys.stderr)
+            return 2
+
+    # If already running, warn and exit successfully
+    try:
+        st = px.get(f"nodes/{target_node}/qemu/{vmid}/status/current")
+        cur = str(st.get("status"))
+        if cur == "running":
+            print("pvectl: VM already running", file=sys.stderr)
+            return 0
+    except requests.exceptions.RequestException:
+        # proceed with start if status cannot be determined
+        pass
+
+    # Start VM; PVE returns a task UPID
+    result = px.post(f"nodes/{target_node}/qemu/{vmid}/status/start")
+    upid = _extract_upid(result)
+    ok = True
+    if upid:
+        ok = _wait_for_task_completion(px, target_node, upid)
+    else:
+        ok = _wait_for_vm_status(px, target_node, int(vmid), "running")
+    if not ok:
+        print("pvectl: start did not complete within timeout", file=sys.stderr)
+        return 2
+    return 0
+
+
+def command_stop(cfg: PvectlConfig, vmid: str) -> int:
+    check_auth(cfg)
+
+    px = Proxmox(cfg.host, cfg.port, cfg.node, cfg.user, cfg.token_id, cfg.token_secret)
+    target_node = cfg.node
+    if not target_node:
+        try:
+            target_node = _resolve_node_for_vmid(px, vmid)
+        except requests.exceptions.RequestException as e:
+            print(f"pvectl: {e}", file=sys.stderr)
+            return 2
+
+    # Hard stop VM (power off)
+    result = px.post(f"nodes/{target_node}/qemu/{vmid}/status/stop")
+    upid = _extract_upid(result)
+    ok = True
+    if upid:
+        ok = _wait_for_task_completion(px, target_node, upid)
+    else:
+        ok = _wait_for_vm_status(px, target_node, int(vmid), "stopped")
+    if not ok:
+        print("pvectl: stop did not complete within timeout", file=sys.stderr)
+        return 2
+    return 0
+
+
+    
+
+
+# console command intentionally omitted; use SSH or Proxmox UI
+
+
+def command_remove(cfg: PvectlConfig, vmid: str) -> int:
+    check_auth(cfg)
+
+    px = Proxmox(cfg.host, cfg.port, cfg.node, cfg.user, cfg.token_id, cfg.token_secret)
+    # Require numeric VMID; names no longer accepted
+    if not str(vmid).isdigit():
+        print("pvectl: remove requires a VMID; use 'list --name' to find VMIDs", file=sys.stderr)
+        return 2
+    # Resolve node from VMID
+    try:
+        target_node = _resolve_node_for_vmid(px, vmid)
+    except requests.exceptions.RequestException as e:
+        print(f"pvectl: {e}", file=sys.stderr)
+        return 2
+
+    # If running, attempt a graceful shutdown first
+    try:
+        st = px.get(f"nodes/{target_node}/qemu/{vmid}/status/current")
+        if str(st.get("status")) == "running":
+            try:
+                res = px.post(f"nodes/{target_node}/qemu/{vmid}/status/shutdown")
+                upid = _extract_upid(res)
+                if upid:
+                    _wait_for_task_completion(px, target_node, upid)
+                else:
+                    _wait_for_vm_status(px, target_node, int(vmid), "stopped")
+            except requests.exceptions.RequestException:
+                # ignore and proceed to delete attempt
+                pass
+    except requests.exceptions.RequestException:
+        pass
+
+    # Remove VM
+    try:
+        result = px.delete(f"nodes/{target_node}/qemu/{vmid}")
+    except requests.exceptions.RequestException as e:
+        print(f"pvectl: remove failed: {e}", file=sys.stderr)
+        return 2
+
+    upid = _extract_upid(result)
+    ok = True
+    if upid:
+        ok = _wait_for_task_completion(px, target_node, upid)
+    # Print vmid on success; else report timeout
+    if not ok:
+        print("pvectl: remove did not complete within timeout", file=sys.stderr)
+        return 2
+    print(vmid)
+    return 0
+
+
+# ---- Entrypoint ----
+
+def main(argv: list[str] | None = None) -> int:
+    argv = argv if argv is not None else sys.argv[1:]
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if not args.command:
+        parser.print_help(sys.stderr)
+        return 2
+
+    cfg = load_config(args)
+
+    # Direct lookup of function named command_<name> or command_<name>_<sub>
+    # Resolve command function name, supporting nested subcommands (including hyphenated commands)
+    base = str(args.command)
+    sanitized = base.replace("-", "_")
+    func_name = f"command_{sanitized}"
+    # Generic nested subcommand resolution: looks for an attribute named "<command>_command" (with hyphens sanitized)
+    sub_attr = f"{sanitized}_command"
+    sub_name = getattr(args, sub_attr, None)
+    if sub_name:
+        func_name = f"command_{sanitized}_{sub_name}"
+    func = globals().get(func_name)
+    if not func:
+        parser.error(f"unknown command: {args.command}")
+        return 2
+
+    sig = inspect.signature(func)
+    bound_kwargs = {}
+    for i, (param_name, param) in enumerate(sig.parameters.items()):
+        if i == 0:
+            # First parameter must be the config object
+            continue
+        if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
+            if hasattr(args, param_name):
+                bound_kwargs[param_name] = getattr(args, param_name)
+            else:
+                # leave missing; rely on function defaults if any
+                pass
+        # Ignore VAR_POSITIONAL/VAR_KEYWORD for now
+
+    rc = func(cfg, **bound_kwargs)
+    if isinstance(rc, int):
+        return rc
+    return 0
+
+
+def command_info(cfg: PvectlConfig, vmid: str, node: Optional[str] = None) -> int:
+    # Validate config
+    check_auth(cfg)
+
+    # Determine node
+    px_tmp = Proxmox(cfg.host, cfg.port, cfg.node, cfg.user, cfg.token_id, cfg.token_secret)
+    target_node = node or cfg.node
+    if not target_node:
+        try:
+            target_node = _resolve_node_for_vmid(px_tmp, vmid)
+        except requests.exceptions.RequestException as e:
+            print(f"pvectl: {e}", file=sys.stderr)
+            return 2
+
+    # Query VM config
+    px = Proxmox(cfg.host, cfg.port, target_node, cfg.user, cfg.token_id, cfg.token_secret)
+    conf = px.get(f"nodes/{target_node}/qemu/{vmid}/config")
+
+    # Basic fields
+    name = conf.get("name")
+    cores = conf.get("cores")
+    memory = conf.get("memory")  # MiB
+
+    # Print core attributes
+    print(f"vmid: {vmid}")
+    print(f"node: {target_node}")
+    if name is not None:
+        print(f"name: {name}")
+    if cores is not None:
+        print(f"cores: {cores}")
+    if memory is not None:
+        print(f"memory: {memory}")
+
+    # Disks and CD-ROMs
+    for key, val in conf.items():
+        if not isinstance(key, str):
+            continue
+        # Device keys: scsiX, sataX, virtioX, ideX
+        if re.fullmatch(r"(scsi|sata|virtio|ide)\d+", key):
+            sval = str(val)
+            if "media=cdrom" in sval:
+                print(f"cdrom: {key} {sval}")
+            else:
+                print(f"disk: {key} {sval}")
+
+    # NICs
+    for key, val in conf.items():
+        if isinstance(key, str) and re.fullmatch(r"net\d+", key):
+            print(f"nic: {key} {val}")
+
+    return 0
+
+
+def command_cdrom_add(cfg: PvectlConfig, vmid: str, slot: str = "ide2", storage: str = "local", iso: str = "", node: Optional[str] = None) -> int:
+    check_auth(cfg)
+
+    if not iso:
+        print("pvectl: --iso is required", file=sys.stderr)
+        return 2
+
+    # Resolve node (use provided/global or discover by vmid)
+    px = Proxmox(cfg.host, cfg.port, cfg.node, cfg.user, cfg.token_id, cfg.token_secret)
+    target_node = node or cfg.node
+    if not target_node:
+        target_node = _resolve_node_for_vmid(px, vmid)
+
+    # Old ISO listing via '?' removed; use 'iso list' command instead
+    if iso == "?":
+        print("pvectl: use 'iso list --storage <id>' to list ISO images", file=sys.stderr)
+        return 2
+
+    # Before attach, require VM to be powered off
+    try:
+        st = px.get(f"nodes/{target_node}/qemu/{vmid}/status/current")
+        cur = str(st.get("status"))
+        if cur != "stopped":
+            print("pvectl: cdrom add requires VM to be off; power off first", file=sys.stderr)
+            return 2
+    except requests.exceptions.RequestException:
+        print("pvectl: could not determine VM status; refusing online cdrom add", file=sys.stderr)
+        return 2
+
+    # Determine final slot: prefer ide2, but auto-pick next-free ideX if occupied
+    try:
+        conf = px.get(f"nodes/{target_node}/qemu/{vmid}/config")
+    except requests.exceptions.RequestException:
+        conf = {}
+    final_slot = slot
+    if isinstance(conf, dict) and slot in conf:
+        picked = _find_next_free_slot(px, target_node, int(vmid), bus="ide")
+        if picked:
+            final_slot = picked
+
+    # Attach ISO as CD-ROM at slot: ideX=storage:iso/file.iso,media=cdrom
+    spec = f"{storage}:iso/{iso},media=cdrom"
+    data = {final_slot: spec}
+    result = px.post(f"nodes/{target_node}/qemu/{vmid}/config", data=data)
+    upid = _extract_upid(result)
+    ok = True
+    if upid:
+        ok = _wait_for_task_completion(px, target_node, upid)
+    else:
+        ok = _wait_for_config_key(px, target_node, int(vmid), final_slot)
+    if not ok:
+        print("pvectl: cdrom add did not complete within timeout", file=sys.stderr)
+        return 2
+    # Context message to stderr; stdout prints the slot only
+    print(f"cdrom add: vmid {vmid} slot {final_slot} iso {iso} storage {storage}", file=sys.stderr)
+    print(final_slot)
+    return 0
+
+
+def command_cdrom_remove(cfg: PvectlConfig, vmid: str, slot: Optional[str] = None, node: Optional[str] = None) -> int:
+    check_auth(cfg)
+
+    # Resolve node
+    px = Proxmox(cfg.host, cfg.port, cfg.node, cfg.user, cfg.token_id, cfg.token_secret)
+    target_node = node or cfg.node
+    if not target_node:
+        target_node = _resolve_node_for_vmid(px, vmid)
+
+    # Fetch current config
+    try:
+        conf = px.get(f"nodes/{target_node}/qemu/{vmid}/config")
+    except requests.exceptions.RequestException:
+        conf = {}
+
+    # Reject legacy '--slot ?' usage; direct to 'cdrom list'
+    if slot == "?":
+        print("pvectl: use 'cdrom list <vmid>' to list CD-ROM device slots", file=sys.stderr)
+        return 2
+
+    # Auto-select slot: prefer ide2 if it's a cdrom, else first cdrom device found
+    if not slot:
+        pick = None
+        if isinstance(conf, dict) and "ide2" in conf and "media=cdrom" in str(conf["ide2"]):
+            pick = "ide2"
+        else:
+            for key, val in (conf.items() if isinstance(conf, dict) else []):
+                if isinstance(key, str) and re.fullmatch(r"(scsi|sata|virtio|ide)\d+", key):
+                    if "media=cdrom" in str(val):
+                        pick = key
+                        break
+        if not pick:
+            print("pvectl: no CD-ROM device found; use 'cdrom list <vmid>' or attach first", file=sys.stderr)
+            return 2
+        slot = pick
+
+    # Before removal, require VM to be powered off
+    try:
+        st = px.get(f"nodes/{target_node}/qemu/{vmid}/status/current")
+        cur = str(st.get("status"))
+        if cur != "stopped":
+            print("pvectl: cdrom remove requires VM to be off; power off first", file=sys.stderr)
+            return 2
+    except requests.exceptions.RequestException:
+        # If status cannot be determined, err on the safe side
+        print("pvectl: could not determine VM status; refusing online cdrom remove", file=sys.stderr)
+        return 2
+
+    # Remove device: use delete=<slot>
+    try:
+        result = px.post(f"nodes/{target_node}/qemu/{vmid}/config", data={"delete": slot})
+    except requests.exceptions.RequestException as e:
+        print(f"pvectl: cdrom remove failed: {e}", file=sys.stderr)
+        return 2
+
+    upid = _extract_upid(result)
+    ok = True
+    if upid:
+        ok = _wait_for_task_completion(px, target_node, upid)
+    else:
+        ok = _wait_for_config_key_absent(px, target_node, int(vmid), str(slot))
+    if not ok:
+        print("pvectl: cdrom remove did not complete within timeout", file=sys.stderr)
+        return 2
+    # Context message to stderr; stdout prints the slot only
+    print(f"cdrom remove: vmid {vmid} slot {slot}", file=sys.stderr)
+    print(str(slot))
+    return 0
+
+
+def command_cdrom_list(cfg: PvectlConfig, vmid: str, node: Optional[str] = None) -> int:
+    check_auth(cfg)
+
+    # Resolve node
+    px = Proxmox(cfg.host, cfg.port, cfg.node, cfg.user, cfg.token_id, cfg.token_secret)
+    target_node = node or cfg.node
+    if not target_node:
+        target_node = _resolve_node_for_vmid(px, vmid)
+
+    # Fetch current config and list CD-ROM device slots
+    try:
+        conf = px.get(f"nodes/{target_node}/qemu/{vmid}/config")
+    except requests.exceptions.RequestException:
+        conf = {}
+    entries: list[tuple[str, str]] = []
+    for key, val in (conf.items() if isinstance(conf, dict) else []):
+        if isinstance(key, str) and re.fullmatch(r"(scsi|sata|virtio|ide)\d+", key):
+            sval = str(val)
+            if "media=cdrom" in sval:
+                iso_name = ""
+                storage = ""
+                # Expect pattern like: storage:iso/<file>,media=cdrom
+                if ":iso/" in sval:
+                    storage, _, rest = sval.partition(":iso/")
+                    if rest:
+                        iso_name = rest.split(",", 1)[0]
+                # Show slot with ISO filename if present; else indicate empty
+                display = iso_name if iso_name else "<none>"
+                entries.append((key, display))
+    for slot, iso in sorted(entries):
+        # Print: "slot filename.iso" or "slot -" if no ISO
+        print(f"{slot} {iso}")
+    return 0
+
+
+def command_cdrom_eject(cfg: PvectlConfig, vmid: str, slot: Optional[str] = None, node: Optional[str] = None) -> int:
+    check_auth(cfg)
+
+    # Resolve node
+    px = Proxmox(cfg.host, cfg.port, cfg.node, cfg.user, cfg.token_id, cfg.token_secret)
+    target_node = node or cfg.node
+    if not target_node:
+        target_node = _resolve_node_for_vmid(px, vmid)
+
+    # Fetch current config
+    try:
+        conf = px.get(f"nodes/{target_node}/qemu/{vmid}/config")
+    except requests.exceptions.RequestException:
+        conf = {}
+
+    # Reject legacy '--slot ?' usage; direct to 'cdrom list'
+    if slot == "?":
+        print("pvectl: use 'cdrom list <vmid>' to list CD-ROM device slots", file=sys.stderr)
+        return 2
+
+    # Auto-select slot: prefer ide2 if it's a cdrom, else first cdrom device found
+    if not slot:
+        pick = None
+        if isinstance(conf, dict) and "ide2" in conf and "media=cdrom" in str(conf.get("ide2", "")):
+            pick = "ide2"
+        else:
+            for key, val in (conf.items() if isinstance(conf, dict) else []):
+                if isinstance(key, str) and re.fullmatch(r"(scsi|sata|virtio|ide)\d+", key):
+                    if "media=cdrom" in str(val):
+                        pick = key
+                        break
+        if not pick:
+            print("pvectl: no CD-ROM device found; use 'cdrom list <vmid>' or attach first", file=sys.stderr)
+            return 2
+        slot = pick
+
+    # Eject ISO but keep the drive: set to none,media=cdrom
+    try:
+        result = px.post(f"nodes/{target_node}/qemu/{vmid}/config", data={slot: "none,media=cdrom"})
+    except requests.exceptions.RequestException as e:
+        print(f"pvectl: cdrom eject failed: {e}", file=sys.stderr)
+        return 2
+
+    upid = _extract_upid(result)
+    ok = True
+    if upid:
+        ok = _wait_for_task_completion(px, target_node, upid)
+    else:
+        ok = _wait_for_cdrom_ejected(px, target_node, int(vmid), str(slot))
+    if not ok:
+        print("pvectl: cdrom eject did not complete within timeout", file=sys.stderr)
+        return 2
+    return 0
+
+
+def command_iso_list(cfg: PvectlConfig, storage: str = "local", verbose: bool = False) -> int:
+    check_auth(cfg)
+    px = Proxmox(cfg.host, cfg.port, cfg.node, cfg.user, cfg.token_id, cfg.token_secret)
+
+    # If storage is '?', list storages supporting 'iso'
+    if storage == "?":
+        items = px.get(f"nodes/{cfg.node}/storage")
+        for it in items:
+            name = it.get("storage") or it.get("name")
+            content = str(it.get("content", ""))
+            if name and ("iso" in content):
+                print(str(name))
+        return 0
+
+    # Verbose: indicate storage (stderr) and indent filenames on stdout
+    if verbose:
+        print(f"storage: {storage}", file=sys.stderr)
+
+    items = px.get(f"nodes/{cfg.node}/storage/{storage}/content")
+    names: list[str] = []
+    for it in items:
+        if str(it.get("content")) == "iso":
+            volid = str(it.get("volid", ""))
+            if "iso/" in volid:
+                names.append(volid.split("iso/", 1)[1])
+            else:
+                names.append(volid)
+    for name in sorted(names):
+        if verbose:
+            print(f"  {name}")
+        else:
+            # Non-verbose: plain filenames for shell consumption
+            print(name)
+    return 0
+
+
+def command_iso_upload(cfg: PvectlConfig, storage: str = "local", file: str = "") -> int:
+    check_auth(cfg)
+    if not file:
+        print("pvectl: --file is required", file=sys.stderr)
+        return 2
+    path = os.path.expanduser(str(file))
+    if not os.path.isfile(path):
+        print(f"pvectl: file not found: {path}", file=sys.stderr)
+        return 2
+
+    # Streaming multipart upload to storage/upload endpoint
+    px = Proxmox(cfg.host, cfg.port, cfg.node, cfg.user, cfg.token_id, cfg.token_secret)
+    url = f"{px.base}/nodes/{cfg.node}/storage/{storage}/upload"
+    with open(path, "rb") as f:
+        files = {"filename": (os.path.basename(path), f, "application/octet-stream")}
+        data = {"content": "iso"}
+        resp = px.session.post(url, files=files, data=data)
+        if resp.status_code >= 400:
+            try:
+                err = resp.json()
+            except ValueError:
+                err = resp.text[:2000]
+            print(f"pvectl: iso upload failed: {resp.status_code} {err}", file=sys.stderr)
+            return 2
+    # Print uploaded filename
+    print(os.path.basename(path))
+    return 0
+
+
+def command_iso_delete(cfg: PvectlConfig, storage: str = "local", name: str = "") -> int:
+    check_auth(cfg)
+    if not name:
+        print("pvectl: --name is required", file=sys.stderr)
+        return 2
+
+    px = Proxmox(cfg.host, cfg.port, cfg.node, cfg.user, cfg.token_id, cfg.token_secret)
+    # Find volid for the iso name
+    items = px.get(f"nodes/{cfg.node}/storage/{storage}/content")
+    target_volid = None
+    for it in items:
+        if str(it.get("content")) == "iso":
+            volid = str(it.get("volid", ""))
+            fname = volid.split("iso/", 1)[1] if "iso/" in volid else volid
+            if fname == name:
+                target_volid = volid
+                break
+    if not target_volid:
+        print("pvectl: ISO not found in storage", file=sys.stderr)
+        return 2
+
+    try:
+        result = px.delete(f"nodes/{cfg.node}/storage/{storage}/content/{target_volid}")
+    except requests.exceptions.RequestException as e:
+        print(f"pvectl: iso delete failed: {e}", file=sys.stderr)
+        return 2
+    upid = _extract_upid(result)
+    ok = True
+    if upid:
+        ok = _wait_for_task_completion(px, cfg.node, upid)
+    if not ok:
+        print("pvectl: iso delete did not complete within timeout", file=sys.stderr)
+        return 2
+    print(name)
+    return 0
+
+
+def _set_boot_order(px: Proxmox, node_name: str, vm_id: int, order: list[str]) -> bool:
+    # Construct value and post, then wait for completion
+    val = f"order={';'.join(order)}"
+    try:
+        result = px.post(f"nodes/{node_name}/qemu/{vm_id}/config", data={"boot": val})
+        upid = _extract_upid(result)
+        if upid:
+            return _wait_for_task_completion(px, node_name, upid)
+        # Fallback: verify config reflects order
+        for slot in order:
+            if not _ensure_boot_includes(px, node_name, vm_id, slot):
+                return False
+        return True
+    except requests.exceptions.RequestException:
+        return False
+
+
+def command_options(cfg: PvectlConfig, vmid: str, boot: Optional[str] = None, node: Optional[str] = None) -> int:
+    check_auth(cfg)
+    px = Proxmox(cfg.host, cfg.port, cfg.node, cfg.user, cfg.token_id, cfg.token_secret)
+    target_node = node or cfg.node
+    if not target_node:
+        target_node = _resolve_node_for_vmid(px, vmid)
+
+    # List available options when no flags supplied
+    if boot is None:
+        conf = px.get(f"nodes/{target_node}/qemu/{vmid}/config")
+        order = _parse_boot_order_val(conf.get("boot"))
+        if order:
+            print(f"boot: {','.join(order)}")
+        else:
+            raw = conf.get("boot")
+            if raw:
+                print(f"boot: {raw}")
+        return 0
+
+    # "?" listing for boot devices
+    if str(boot) == "?":
+        conf = px.get(f"nodes/{target_node}/qemu/{vmid}/config")
+        devs: list[str] = []
+        for key, val in conf.items():
+            if isinstance(key, str) and (re.fullmatch(r"(scsi|sata|virtio|ide)\d+", key) or re.fullmatch(r"net\d+", key)):
+                devs.append(key)
+        for d in sorted(set(devs)):
+            print(d)
+        return 0
+
+    # Set boot order from comma-separated list
+    parts = [p.strip() for p in str(boot).split(",") if p.strip()]
+    seen = set()
+    order: list[str] = []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            order.append(p)
+    ok = _set_boot_order(px, target_node, int(vmid), order)
+    if not ok:
+        print("pvectl: options --boot update failed", file=sys.stderr)
+        return 2
+    # Context message to stderr; stdout prints the resolved order only
+    print(f"options boot set: vmid {vmid} order {','.join(order)}", file=sys.stderr)
+    print(",".join(order))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

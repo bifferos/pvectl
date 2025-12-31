@@ -1,0 +1,330 @@
+.TH PVECTL 1 "December 2025" "pvectl 0.1.0" "User Commands"
+.SH NAME
+pvectl \- Proxmox VE command-line automation tool for virtual machines
+.SH SYNOPSIS
+.B pvectl
+[\fIGLOBAL-OPTIONS\fR]
+.I COMMAND
+[\fICOMMAND-OPTIONS\fR]
+[\fIARGS\fR]
+.SH DESCRIPTION
+.B pvectl
+is a command-line tool for automating Proxmox VE virtual machine operations,
+designed in the spirit of
+.BR vmrun (1),
+.BR prlctl (1),
+and
+.BR VBoxManage (1).
+It provides a simple, script-friendly interface optimized for test automation
+rather than comprehensive VM management.
+.PP
+This tool is designed for
+.B virtual machines only
+\(em it does not manage Proxmox containers (LXC).
+.PP
+Unlike the full-featured
+.B pvesh
+or web UI,
+.B pvectl
+focuses on common scripting operations with sensible defaults, clean output
+(stdout for data, stderr for progress), and synchronous waiting for task
+completion by default.
+.SH CONFIGURATION
+.B pvectl
+loads configuration from three sources with the following precedence
+(highest to lowest):
+.IP "1." 4
+Command-line options
+.IP "2." 4
+Environment variables
+.IP "3." 4
+Configuration file
+.SS Configuration File
+The default configuration file is
+.IR ~/.pvectl/profile.ini .
+It uses INI format with named profile sections:
+.PP
+.nf
+.RS
+[default]
+host = pve.example.com
+port = 8006
+node = pve1
+user = root@pam
+token_id = automation
+token_secret = xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+
+[production]
+host = pve-prod.example.com
+node = pve-prod
+user = automation@pve
+token_id = deploy
+token_secret = yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy
+.RE
+.fi
+.PP
+Use
+.B --profile
+to select a specific profile, or
+.B --config
+to specify an alternate configuration file path.
+.SS Environment Variables
+.TP
+.B PVECTL_PROFILE
+Profile name to use (default: "default")
+.TP
+.B PVECTL_CONFIG
+Path to configuration file (default: ~/.pvectl/profile.ini)
+.TP
+.B PVECTL_HOST
+Proxmox host (no scheme), e.g., pve.example.com
+.TP
+.B PVECTL_PORT
+Proxmox API port (default: 8006)
+.TP
+.B PVECTL_NODE
+Default Proxmox node name
+.TP
+.B PVECTL_USER
+Proxmox user (e.g., root@pam or user@pve)
+.TP
+.B PVECTL_TOKEN_ID
+Proxmox API token ID
+.TP
+.B PVECTL_TOKEN_SECRET
+Proxmox API token secret
+.TP
+.B PVECTL_DEFAULT_BRIDGE
+Default network bridge for NIC operations (e.g., vmbr0)
+.TP
+.B PVECTL_DEFAULT_DISK_STORAGE
+Default storage for disk operations (e.g., local-lvm)
+.SH GLOBAL OPTIONS
+.TP
+.B --profile \fIPROFILE\fR
+Profile name from configuration file
+.TP
+.B --config \fIPATH\fR
+Path to configuration file (overrides default)
+.TP
+.B --host \fIHOST\fR
+Proxmox host (no https:// prefix)
+.TP
+.B --port \fIPORT\fR
+Proxmox API port (default: 8006)
+.TP
+.B --node \fINODE\fR
+Proxmox node name (required for most operations)
+.TP
+.B --user \fIUSER\fR
+Proxmox user (e.g., root@pam)
+.TP
+.B --token-id \fIID\fR
+API token ID
+.TP
+.B --token-secret \fISECRET\fR
+API token secret
+.TP
+.B --version
+Show version and exit
+.SH COMMANDS
+.SS VM Lifecycle
+.TP
+.B list [\fB--verbose\fR|\fB-v\fR] [\fB--name\fR \fINAME\fR]
+List VM IDs, one per line. With
+.BR --verbose ,
+also print VM names. With
+.BR --name ,
+filter to VMs with exact name match.
+.TP
+.B create \fINAME\fR [\fB--cores\fR \fIN\fR] [\fB--memory\fR \fISIZE\fR]
+Create an empty VM (no disk or NIC). Prints the new VMID.
+Memory size can be specified as MiB (e.g., 2048) or with 'G' suffix for GiB (e.g., 2G).
+Default: 1 core, 2048 MiB memory.
+.TP
+.B start \fIVMID\fR [\fB--force\fR]
+Start a VM. Waits for completion.
+.TP
+.B stop \fIVMID\fR
+Hard stop (power off) a VM. Waits for completion.
+.TP
+.B status \fIVMID\fR [\fB--onoff\fR]
+Show VM status. With
+.BR --onoff ,
+prints only "on" or "off" for shell capture.
+.TP
+.B remove \fIVMID\fR
+Remove a VM. Requires numeric VMID (not name). Attempts graceful shutdown first if running.
+.TP
+.B info \fIVMID\fR
+Show VM hardware configuration (cores, memory, disks, NICs, CD-ROMs).
+.SS Disk Operations
+.TP
+.B disk add \fIVMID\fR [\fB--slot\fR \fISLOT\fR] [\fB--storage\fR \fISTORAGE\fR] [\fB--size\fR \fISIZE\fR]
+Attach a disk to a VM. Prints the slot name.
+.RS
+.IP \(bu 2
+.BR --slot :
+Disk slot (e.g., scsi0, virtio0). Auto-selects next free virtio slot if omitted.
+.IP \(bu 2
+.BR --storage :
+Storage ID. Auto-selects from PVECTL_DEFAULT_DISK_STORAGE, then local-lvm, then first available.
+Use '?' to list available storages.
+.IP \(bu 2
+.BR --size :
+Disk size (e.g., 8G, 20G). Default: 8G.
+.RE
+.SS Network Operations
+.TP
+.B nic add \fIVMID\fR [\fB--slot\fR \fISLOT\fR] [\fB--bridge\fR \fIBRIDGE\fR] [\fB--model\fR \fIMODEL\fR] [\fB--mac\fR \fIMAC\fR]
+Attach a NIC to a VM. Prints the slot name.
+.RS
+.IP \(bu 2
+.BR --slot :
+NIC slot (e.g., net0, net1). Auto-selects next free slot if omitted.
+.IP \(bu 2
+.BR --bridge :
+Bridge name (e.g., vmbr0). Uses PVECTL_DEFAULT_BRIDGE if omitted.
+Use '?' to list available bridges.
+.IP \(bu 2
+.BR --model :
+Model (e.g., virtio, e1000). Default: virtio.
+.IP \(bu 2
+.BR --mac :
+Optional MAC address.
+.RE
+.SS CD-ROM Operations
+All CD-ROM operations require the VM to be powered off for add/remove operations.
+.TP
+.B cdrom add \fIVMID\fR \fB--iso\fR \fIISO\fR [\fB--slot\fR \fISLOT\fR] [\fB--storage\fR \fISTORAGE\fR]
+Create/update a CD-ROM drive and insert ISO. Requires VM off. Prints the slot name.
+Default slot: ide2. Default storage: local.
+.TP
+.B cdrom remove \fIVMID\fR [\fB--slot\fR \fISLOT\fR]
+Remove CD-ROM drive device from VM. Requires VM off.
+Auto-selects ide2 or first CD-ROM device if slot omitted.
+.TP
+.B cdrom list \fIVMID\fR
+List CD-ROM drive slots with attached ISO (or <none>).
+.TP
+.B cdrom eject \fIVMID\fR [\fB--slot\fR \fISLOT\fR]
+Eject ISO from CD-ROM drive (keeps the drive device).
+Auto-selects ide2 or first CD-ROM device if slot omitted.
+.SS ISO Management
+.TP
+.B iso list [\fB--storage\fR \fISTORAGE\fR] [\fB--verbose\fR|\fB-v\fR]
+List ISO images in storage. Default storage: local.
+Use '?' for storage to list storages supporting ISO content.
+With
+.BR --verbose ,
+shows storage name on stderr and indents filenames.
+.TP
+.B iso upload \fB--file\fR \fIFILE\fR [\fB--storage\fR \fISTORAGE\fR]
+Upload a local ISO file to storage. Default storage: local.
+Prints the uploaded filename.
+.TP
+.B iso delete \fB--name\fR \fINAME\fR [\fB--storage\fR \fISTORAGE\fR]
+Delete an ISO from storage. Default storage: local.
+.SS VM Options
+.TP
+.B options \fIVMID\fR [\fB--boot\fR \fIDEVICES\fR]
+Manage VM options. With no flags, displays current boot order.
+.RS
+.IP \(bu 2
+.BR --boot :
+Comma-separated boot device list (e.g., ide2,virtio0,net0).
+Use '?' to list available devices.
+.RE
+.SH OUTPUT CONVENTIONS
+.B pvectl
+follows Unix conventions for script-friendly output:
+.IP \(bu 2
+.B stdout
+contains data suitable for capture (VMIDs, slot names, etc.)
+.IP \(bu 2
+.B stderr
+contains progress messages and context for human operators
+.IP \(bu 2
+Exit code 0 indicates success; non-zero indicates failure
+.PP
+Most operations wait synchronously for task completion and verify results
+before returning, making scripts more reliable.
+.SH EXAMPLES
+.SS Basic VM Creation and Configuration
+.PP
+Create a VM with disk and network, then start it:
+.PP
+.nf
+.RS
+VMID=$(pvectl create test-vm --cores 2 --memory 4G)
+pvectl disk add "$VMID" --size 20G
+pvectl nic add "$VMID" --bridge vmbr0
+pvectl cdrom add "$VMID" --iso alpine-standard-3.20.0-x86_64.iso
+pvectl options "$VMID" --boot ide2,virtio0
+pvectl start "$VMID"
+.RE
+.fi
+.SS Finding and Removing VMs
+.PP
+Find a VM by name and remove it:
+.PP
+.nf
+.RS
+VMID=$(pvectl list --name test-vm)
+if [ -n "$VMID" ]; then
+    pvectl stop "$VMID"
+    pvectl remove "$VMID"
+fi
+.RE
+.fi
+.SS Using Different Profiles
+.PP
+.nf
+.RS
+# Use production profile for deployment
+pvectl --profile production list
+
+# Or use environment variable
+export PVECTL_PROFILE=production
+pvectl create prod-web-01 --memory 8G
+.RE
+.fi
+.SS ISO Management
+.PP
+.nf
+.RS
+# Upload a custom ISO
+pvectl iso upload --file ~/alpine-custom.iso --storage local
+
+# List available ISOs
+pvectl iso list --verbose
+
+# Clean up old ISOs
+pvectl iso delete --name old-version.iso
+.RE
+.fi
+.SH FILES
+.TP
+.I ~/.pvectl/profile.ini
+Default configuration file containing Proxmox connection profiles
+.SH NOTES
+.IP \(bu 2
+TLS certificate verification is intentionally disabled for connections to
+Proxmox API (self-signed certificates are common in test environments).
+.IP \(bu 2
+All operations require proper Proxmox API token authentication.
+Create tokens via the Proxmox web UI under Datacenter \(-> Permissions \(-> API Tokens.
+.IP \(bu 2
+The
+.B node
+parameter is required for all operations. Set it via configuration, environment,
+or the --node option.
+.IP \(bu 2
+Auto-selection of slots and storages follows reasonable defaults but can be
+overridden explicitly when needed.
+.SH SEE ALSO
+.BR pvesh (1),
+.BR qm (1),
+Proxmox VE API documentation at https://pve.proxmox.com/pve-docs/api-viewer/
+.SH AUTHOR
+pvectl was created for simple test automation workflows with Proxmox VE.
