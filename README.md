@@ -1,4 +1,64 @@
-README
+TL;DR
+=====
+
+```
+$ ./pvectl --help
+usage: pvectl [-h] [--version] [--profile PROFILE] [--config CONFIG] [--host HOST] [--port PORT] [--node NODE] [--user USER] [--token-id TOKEN_ID] [--token-secret TOKEN_SECRET]
+              <command> ...
+
+Manage Proxmox VMs and nodes from your local machine.
+
+positional arguments:
+  <command>
+    list                List VMs
+    create              Create an empty VM (no disk/NIC)
+    disk                Disk operations
+    cdrom               CD/DVD drive and ISO operations
+    iso                 Manage ISO images in storage
+    nic                 NIC operations
+    pci                 PCI device operations
+    status              Show VM status
+    start               Start a VM
+    stop                Hard stop (power off) a VM
+    info                Show VM hardware configuration
+    remove              Remove a VM (VMID only)
+    options             Manage VM options
+
+options:
+  -h, --help            show this help message and exit
+  --version             show program's version number and exit
+  --profile PROFILE     Profile name in ~/.pvectl/profile.ini (default: None)
+  --config CONFIG       Path to profiles.ini (override default) (default: None)
+  --host HOST           Proxmox host only (no scheme), e.g. pve.example (default: None)
+  --port PORT           Proxmox API port (default 8006) (default: None)
+  --node NODE           Default Proxmox node name (overrides profile/env) (default: None)
+  --user USER           Proxmox user (e.g. root@pam or user@pve) (default: None)
+  --token-id TOKEN_ID   Proxmox API token id (default: None)
+  --token-secret TOKEN_SECRET
+                        Proxmox API token secret (default: None)
+```
+
+You will create a profile unless you adore cluttered command-lines in your
+scripts:
+
+```
+$ cat ~/.pvectl/profile.ini 
+[default]
+
+host = pve
+port = 8006
+node = pve
+user = root@pam
+token_id = mytoken
+token_secret = 0051a50d-6def-40c4-9e8c-711655b474cc
+```
+
+Get api tokens in proxmox from Datacenter -> Permissions -> API tokens.
+Don't forget to un-check prilege separation when you create your token, unless you want the token to do
+nothing much.
+
+
+Waffle
 ======
 
 Yet more copilot-generated slop to add to the ether.  Don't use this.  I
