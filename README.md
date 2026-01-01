@@ -87,6 +87,6 @@ about this, rightly so, but it just adds to the complexity.  So single
 monolithic Python script it is, with minimal deps (requests is usually
 included in most OS Pythons, e.g. Linux Mint built-in Python has that,
 and easy to wire into a Homebrew setup as they support versions of 
-Pythin in the cellar.  So here is pvectl, use at your own risk, if it 
+Python in the cellar.  So here is pvectl, use at your own risk, if it 
 deletes all your virtual machines it's your own fault, I'm not 
 responsible.
